@@ -12,6 +12,7 @@ https://github.com/eldar/pose-tensorflow
 """
 
 import re
+import sys
 
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
@@ -183,7 +184,7 @@ class PoseNet:
         heads = self.get_net(inputs)
         return self.add_inference_layers(heads)
 
-    def inference(self, inputs):
+    def inference(self, inputs, aux):
         """ Direct TF inference on GPU.
         Added with: https://arxiv.org/abs/1909.11229 
         """
@@ -192,13 +193,22 @@ class PoseNet:
         probs = tf.sigmoid(heads["part_pred"])
 
         if self.cfg['batch_size'] == 1:
+            print("WOOOOO LOOK AT US INFERENCING!!!!")
+            print("history:", aux)
+            print(self.cfg)
             # assuming batchsize 1 here!
             probs = tf.squeeze(probs, axis=0)
+
             locref = tf.squeeze(locref, axis=0)
             l_shape = tf.shape(probs)
 
             locref = tf.reshape(locref, (l_shape[0] * l_shape[1], -1, 2))
             probs = tf.reshape(probs, (l_shape[0] * l_shape[1], -1))
+            aux_r = tf.reshape(aux, (l_shape[0] * l_shape[1], -1))
+
+            # APPLY MASK
+            probs = tf.add(probs, aux_r)
+
             maxloc = tf.argmax(probs, axis=0)
 
             loc = tf.unravel_index(
@@ -222,8 +232,9 @@ class PoseNet:
             )
             pose = tf.concat([pose, likelihood], axis=1)
 
-            return {"pose": pose}
+            return {"pose": pose, "probs": probs}
         else:
+            print("Batch-size != 1")
             # probs = tf.squeeze(probs, axis=0)
             l_shape = tf.shape(probs)  # batchsize times x times y times body parts
             # locref = locref*cfg.locref_stdev

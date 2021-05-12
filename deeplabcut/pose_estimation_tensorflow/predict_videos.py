@@ -17,6 +17,7 @@ import os
 import os.path
 import time
 from pathlib import Path
+import math
 
 import cv2
 import numpy as np
@@ -146,6 +147,7 @@ def analyze_videos(
     --------
 
     """
+    print("WE ARE RUNNING THE MODIFIED VERSION!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
     if "TF_CUDNN_USE_AUTOTUNE" in os.environ:
         del os.environ["TF_CUDNN_USE_AUTOTUNE"]  # was potentially set during training
 
@@ -265,8 +267,10 @@ def analyze_videos(
         xyz_labs = ["x", "y", "likelihood"]
 
     # sess, inputs, outputs = predict.setup_pose_prediction(dlc_cfg)
+    aux = None
     if TFGPUinference:
-        sess, inputs, outputs = predict.setup_GPUpose_prediction(dlc_cfg)
+        sess, inputs, outputs, aux = predict.setup_GPUpose_prediction(dlc_cfg)
+        print("HERE WE HAS MADE OUTPUTS", sess, inputs, outputs, aux)
     else:
         sess, inputs, outputs = predict.setup_pose_prediction(dlc_cfg)
 
@@ -318,6 +322,7 @@ def analyze_videos(
                     destfolder,
                     TFGPUinference,
                     dynamic,
+                    aux=aux
                 )
 
         os.chdir(str(start_path))
@@ -453,19 +458,75 @@ def GetPoseS(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes):
     pbar.close()
     return PredictedData, nframes
 
+def gaussian_heatmap(center = (2, 2), image_size = (10, 10), sig = 1):
+    """
+    It produces single gaussian at expected center
+    :param center:  the mean position (X, Y) - where high value expected
+    :param image_size: The total image size (width, height)
+    :param sig: The sigma value
+    :return:
 
-def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes):
+    from: https://stackoverflow.com/a/58621239
+    """
+    x_axis = np.linspace(0, image_size[0]-1, image_size[0]) - center[0]
+    y_axis = np.linspace(0, image_size[1]-1, image_size[1]) - center[1]
+    xx, yy = np.meshgrid(x_axis, y_axis)
+    kernel = np.exp(-0.5 * (np.square(xx) + np.square(yy)) / np.square(sig))
+    return kernel.astype(float)
+
+
+class KalmanFilter:
+    def __init__(self):
+        self.kf = cv2.KalmanFilter(4, 2)
+        self.kf.measurementMatrix = np.array([[1, 0, 0, 0],
+                                              [0, 1, 0, 0]], dtype=np.float32)
+
+        self.kf.transitionMatrix = np.array([[1, 0, 1, 0],
+                                             [0, 1, 0, 1],
+                                             [0, 0, 1, 0],
+                                             [0, 0, 0, 1]], dtype=np.float32)
+
+        self.kf.processNoiseCov = np.array([[1, 0, 0, 0],
+                                            [0, 1, 0, 0],
+                                            [0, 0, 1, 0],
+                                            [0, 0, 0, 1]], np.float32) * 1
+
+    def correct(self, x, y):
+        self.kf.correct(np.array([x, y], dtype=np.float32))
+
+    def predict(self):
+        return self.kf.predict()
+
+
+def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
     """ Non batch wise pose estimation for video cap."""
+    ny, nx = int(cap.get(4)), int(cap.get(3))
+    nbparts = dlc_cfg['num_joints']
+    print(f'GetPoseS_GTF for {nframes} {nx}x{ny} frames with {nbparts} bodyparts')
+
     if cfg["cropping"]:
         ny, nx = checkcropping(cfg, cap)
 
-    pose_tensor = predict.extract_GPUprediction(
-        outputs, dlc_cfg
-    )  # extract_output_tensor(outputs, dlc_cfg)
+    # get the TF output tensors
+    out_dict = predict.extract_GPUprediction(outputs, dlc_cfg)
+    pose_tensor = out_dict["pose"]
+    prob_tensor = out_dict["probs"]
+
+    print("Got the tensors:", pose_tensor, prob_tensor)
     PredictedData = np.zeros((nframes, 3 * len(dlc_cfg["all_joints_names"])))
+    KFPredicted = [np.zeros((nframes, 3)) for n in range(nbparts)]
+    KFilter = [KalmanFilter() for n in range(nbparts)]
     pbar = tqdm(total=nframes)
+
     counter = 0
-    step = max(10, int(nframes / 100))
+    step = min(1, max(10, int(nframes / 1000)))
+
+    tqdm.write("Opening Video Capture")
+
+    offenders = [(n, n + (nbparts // 2)) for n in range(nbparts // 2)]  # (n, n+4) for n in range(4)
+    print("offenders:", offenders)
+
+    LDBG = False
     while cap.isOpened():
         if counter % step == 0:
             pbar.update(step)
@@ -479,11 +540,58 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes):
                 )
             else:
                 frame = img_as_ubyte(frame)
+            frame_s = np.expand_dims(frame, axis=0).astype(float)
 
-            pose = sess.run(
-                pose_tensor,
-                feed_dict={inputs: np.expand_dims(frame, axis=0).astype(float)},
+            mask = np.ones((88, 88, nbparts), dtype=float)*0
+
+            last_prediction = PredictedData[counter-1, :].reshape(-1, 3) if counter else None
+            kf_prediction = []
+
+            for n in range(nbparts):
+                if last_prediction is None:
+                    continue
+                if LDBG: print(f'updating KF {n} with {last_prediction[n, :]}')
+                KFilter[n].correct(last_prediction[n, 0], last_prediction[n, 1])
+                if LDBG: print("Getting next position")
+                kf_prediction.append(KFilter[n].predict().flatten())
+                if LDBG: print(f'prediction: {kf_prediction[n]}')
+
+                if LDBG: tqdm.write("building mask")
+                offender_pair = [op for op in offenders if n in op][0]
+                # print("Offender pair:", offender_pair, [cfg['bodyparts'][o] for o in offender_pair])
+
+                # sig = abs(math.sin(counter / 150 * 2 * math.pi)) * 3 + 0.5
+                positive_sigma = 2
+                negative_sigma = 1.5
+                positive_bias, negative_bias = 0.9, 0.9
+
+                x = int(last_prediction[n, 0] * (88/frame.shape[1]))
+                y = int(last_prediction[n, 1] * (88/frame.shape[0]))
+                positive_bias = gaussian_heatmap(center=(x, y), image_size=(88, 88), sig=positive_sigma) * positive_bias
+
+                xo = int(last_prediction[(n+nbparts//2) % nbparts, 0] * (88/frame.shape[1]))
+                yo = int(last_prediction[(n+nbparts//2) % nbparts, 1] * (88/frame.shape[0]))
+                negative_bias = gaussian_heatmap(center=(xo, yo), image_size=(88, 88), sig=negative_sigma) * -negative_bias
+                mask[:, :, n] = negative_bias
+                mask[:, :, n][positive_bias > 0.1] = 0
+                mask[:, :, n] = mask[:, :, n] + positive_bias
+                if LDBG: tqdm.write("mask done")
+
+            # mask[x, y, :] = 0
+
+            # sess_res = sess.run(
+            #     pose_tensor,
+            #     feed_dict={inputs: frame_s, aux: mask},
+            # )
+
+            if LDBG: tqdm.write("Launching TF session....")
+            sess_res, sess_res_prob = sess.run(
+                [pose_tensor, prob_tensor],
+                feed_dict={inputs: frame_s, aux: mask},
             )
+            if LDBG: tqdm.write("Session Done!")
+
+            pose = sess_res
             pose[:, [0, 1, 2]] = pose[:, [1, 0, 2]]
             # pose = predict.getpose(frame, dlc_cfg, sess, inputs, outputs)
             PredictedData[
@@ -491,6 +599,76 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes):
             ] = (
                 pose.flatten()
             )  # NOTE: thereby cfg['all_joints_names'] should be same order as bodyparts!
+
+            # Writing prob_map out to images
+            show_live = True
+            save_img = True
+            if (save_img):
+                if LDBG: tqdm.write("Prepping output img")
+                ofw = 88
+                nfw = ofw*2
+                weighting = 0.35
+                smol_frame = cv2.resize(frame, (nfw, nfw), interpolation=cv2.INTER_AREA)*weighting
+
+                if LDBG: tqdm.write("reshaping prob map")
+                prob_map = sess_res_prob.reshape((ofw, ofw, nbparts))
+                fname = f'img_out/{counter:05d}.png'
+
+                arr_out = np.zeros((2*ofw, (nbparts//2)*ofw, 1), dtype='uint8')
+
+                if LDBG: tqdm.write("arranging maps")
+                for n in range(nbparts):
+                    row = n // (nbparts // 2)
+                    col = n % (nbparts // 2)
+                    arr_out[row*ofw:(row+1)*ofw, col*ofw:(col+1)*ofw, 0] = np.abs(prob_map[:, :, n] * 255).astype('uint8')
+
+                # HERE WE SHOULD DELAY THE CASTING TO UINT8 UNTIL LAST MOMENT!
+                # * do everything in float
+                # * deal with positive/negative likelihoods seperately for shifted coloring
+                # * abs it, then cast it
+
+                if LDBG: tqdm.write("Converting image")
+                probs_img = cv2.cvtColor(arr_out, cv2.COLOR_GRAY2BGR)
+                # top row/bottom row
+                probs_img[:ofw, :, 2] = probs_img[:ofw, :, 2]/2
+                probs_img[ofw:, :, 0] = probs_img[ofw:, :, 0]/2
+                for n in range(nbparts//2):
+                    probs_img[:, ofw*n:ofw*(n+1), 1] = probs_img[:, ofw*n:ofw*(n+1), 1] * ((n+1) / (nbparts//2))
+
+                if LDBG: tqdm.write("Resizing image")
+                img_out = cv2.resize(probs_img, ((nbparts//2)*nfw, 2*nfw), interpolation=cv2.INTER_CUBIC)
+
+                # stacking/overlay after resize
+                if LDBG: tqdm.write("Overlaying images")
+                for n in range(nbparts):
+                    row = n // (nbparts//2)
+                    col = n % (nbparts//2)
+                    img_out[row*nfw:(row+1)*nfw, col*nfw:(col+1)*nfw, :] = \
+                    img_out[row*nfw:(row+1)*nfw, col*nfw:(col+1)*nfw, :]*(1-weighting) \
+                        + smol_frame
+
+                    # label the predicted point
+                    fs_ratio_x = nfw/frame.shape[1]
+                    fs_ratio_y = nfw/frame.shape[0]
+                    px, py, pl = pose[n, :]
+                    # print(px, py, pl)
+                    px = int(px*fs_ratio_x+col*nfw)
+                    py = int(py*fs_ratio_y+row*nfw)
+                    cw = int(6//2)
+
+                    cv2.line(img_out, (px - cw, py), (px + cw, py), (255, 255, 255), 1)
+                    cv2.line(img_out, (px, py - cw), (px, py + cw), (255, 255, 255), 1)
+
+                    if last_prediction is not None:
+                        kfx = int(kf_prediction[n][0]*fs_ratio_x +col*nfw)
+                        kfy = int(kf_prediction[n][1]*fs_ratio_y +row*nfw)
+                        kfux = int(kf_prediction[n][2])
+                        kfuy = int(kf_prediction[n][3])
+                        cv2.line(img_out, (kfx - kfux, kfy), (kfx + kfux, kfy), (0, 0, 255), 1)
+                        cv2.line(img_out, (kfx, kfy - kfuy), (kfx, kfy + kfuy), (0, 0, 255), 1)
+
+                cv2.imwrite(fname, img_out)
+
         elif counter >= nframes:
             break
         counter += 1
@@ -518,6 +696,8 @@ def GetPoseF_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, batchsize):
     counter = 0
     step = max(10, int(nframes / 100))
     inds = []
+    aux = np.zeros((nx, ny, 8), dtype='float32')
+    print('LAUNCHING ...')
     while cap.isOpened():
         if counter % step == 0:
             pbar.update(step)
@@ -531,9 +711,14 @@ def GetPoseF_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, batchsize):
             else:
                 frames[batch_ind] = img_as_ubyte(frame)
             inds.append(counter)
+            # fill aux from history (or nonsense)
+            aux[ind, ind, :] = 1
+
             if batch_ind == batchsize - 1:
                 # pose = predict.getposeNP(frames,dlc_cfg, sess, inputs, outputs)
-                pose = sess.run(pose_tensor, feed_dict={inputs: frames})
+                pose, probs, auxd = sess.run(pose_tensor, feed_dict={inputs: frames, aux: aux})
+                print(probs, auxd)
+                pbar.write('DEMO')
                 pose[:, [0, 1, 2]] = pose[
                     :, [1, 0, 2]
                 ]  # change order to have x,y,confidence
@@ -654,15 +839,17 @@ def AnalyzeVideo(
     destfolder=None,
     TFGPUinference=True,
     dynamic=(False, 0.5, 10),
+    aux=None,
 ):
     """ Helper function for analyzing a video. """
-    print("Starting to analyze % ", video)
+    print("Starting to analyze ", video)
 
     if destfolder is None:
         destfolder = str(Path(video).parents[0])
     auxiliaryfunctions.attempttomakefolder(destfolder)
     vname = Path(video).stem
     try:
+        pass
         _ = auxiliaryfunctions.load_analyzed_data(destfolder, vname, DLCscorer)
     except FileNotFoundError:
         print("Loading ", video)
@@ -696,8 +883,9 @@ def AnalyzeVideo(
 
         dynamic_analysis_state, detectiontreshold, margin = dynamic
         start = time.time()
-        print("Starting to extract posture")
+        print("Starting to extract posture")  # this is the one we are calling single animal
         if dynamic_analysis_state:
+            print('We are going dynamically something somethign')
             PredictedData, nframes = GetPoseDynamic(
                 cfg,
                 dlc_cfg,
@@ -711,8 +899,10 @@ def AnalyzeVideo(
             )
             # GetPoseF_GTF(cfg,dlc_cfg, sess, inputs, outputs,cap,nframes,int(dlc_cfg["batch_size"]))
         else:
+            print('We are NOT going dynamically. TFGPU:', TFGPUinference)
             if int(dlc_cfg["batch_size"]) > 1:
                 if TFGPUinference:
+                    print('HERE WE GOOOOOOOO: TFGPUinference starting GetPoseF_GTF')
                     PredictedData, nframes = GetPoseF_GTF(
                         cfg,
                         dlc_cfg,
@@ -722,8 +912,10 @@ def AnalyzeVideo(
                         cap,
                         nframes,
                         int(dlc_cfg["batch_size"]),
+                        aux=aux,
                     )
                 else:
+                    print('HERE WE GOOOOOOOO: TFGPUinference starting GetPoseF')
                     PredictedData, nframes = GetPoseF(
                         cfg,
                         dlc_cfg,
@@ -736,10 +928,12 @@ def AnalyzeVideo(
                     )
             else:
                 if TFGPUinference:
+                    print('HERE WE GOOOOOOOO: TFGPUinference starting GetPoseS_GTF')
                     PredictedData, nframes = GetPoseS_GTF(
-                        cfg, dlc_cfg, sess, inputs, outputs, cap, nframes
+                        cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=aux
                     )
                 else:
+                    print('HERE WE GOOOOOOOO: TFGPUinference starting GetPoseS')
                     PredictedData, nframes = GetPoseS(
                         cfg, dlc_cfg, sess, inputs, outputs, cap, nframes
                     )
