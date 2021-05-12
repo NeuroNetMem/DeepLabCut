@@ -9,10 +9,11 @@ Licensed under GNU Lesser General Public License v3.0
 
 Adapted from DeeperCut by Eldar Insafutdinov
 https://github.com/eldar/pose-tensorflow
+
+Implements ResNet 50 - 152 with 1 deconv. layer and overall stride 8 for single and multi-animal (with PAF)
 """
 
 import re
-import sys
 
 import tensorflow as tf
 import tensorflow.contrib.slim as slim
@@ -40,7 +41,7 @@ def prediction_layer(cfg, input, name, num_outputs):
         padding="SAME",
         activation_fn=None,
         normalizer_fn=None,
-        weights_regularizer=slim.l2_regularizer(cfg['weight_decay']),
+        weights_regularizer=slim.l2_regularizer(cfg["weight_decay"]),
     ):
         with tf.variable_scope(name):
             pred = slim.conv2d_transpose(
@@ -50,9 +51,9 @@ def prediction_layer(cfg, input, name, num_outputs):
 
 
 def get_batch_spec(cfg):
-    num_joints = cfg['num_joints']
-    num_limbs = cfg['num_limbs']
-    batch_size = cfg['batch_size']
+    num_joints = cfg["num_joints"]
+    num_limbs = cfg["num_limbs"]
+    batch_size = cfg["batch_size"]
     batch_spec = {
         Batch.inputs: [batch_size, None, None, 3],
         Batch.part_score_targets: [
@@ -68,13 +69,20 @@ def get_batch_spec(cfg):
             num_joints + cfg.get("num_idchannel", 0),
         ],
     }
-    if cfg['location_refinement']:
+    if cfg["location_refinement"]:
         batch_spec[Batch.locref_targets] = [batch_size, None, None, num_joints * 2]
         batch_spec[Batch.locref_mask] = [batch_size, None, None, num_joints * 2]
-    if cfg['pairwise_predict']:
-        print("Getting specs", cfg['dataset_type'], num_limbs, num_joints)
+    if cfg["pairwise_predict"]:
+        print(
+            "Getting specs:",
+            cfg["dataset_type"],
+            "Number of Limbs:",
+            num_limbs,
+            "No. of Joints:",
+            num_joints,
+        )
         if (
-            "multi-animal" not in cfg['dataset_type']
+            "multi-animal" not in cfg["dataset_type"]
         ):  # this can be used for pairwise conditional
             batch_spec[Batch.pairwise_targets] = [
                 batch_size,
@@ -89,18 +97,8 @@ def get_batch_spec(cfg):
                 num_joints * (num_joints - 1) * 2,
             ]
         else:  # train partaffinity fields
-            batch_spec[Batch.pairwise_targets] = [
-                batch_size,
-                None,
-                None,
-                num_limbs * 2,
-            ]
-            batch_spec[Batch.pairwise_mask] = [
-                batch_size,
-                None,
-                None,
-                num_limbs * 2,
-            ]
+            batch_spec[Batch.pairwise_targets] = [batch_size, None, None, num_limbs * 2]
+            batch_spec[Batch.pairwise_mask] = [batch_size, None, None, num_limbs * 2]
     return batch_spec
 
 
@@ -109,10 +107,13 @@ class PoseNet:
         self.cfg = cfg
 
     def extract_features(self, inputs):
-        net_fun = net_funcs[self.cfg['net_type']]
+        net_fun = net_funcs[self.cfg["net_type"]]
 
         mean = tf.constant(
-            self.cfg['mean_pixel'], dtype=tf.float32, shape=[1, 1, 1, 3], name="img_mean"
+            self.cfg["mean_pixel"],
+            dtype=tf.float32,
+            shape=[1, 1, 1, 3],
+            name="img_mean",
         )
         im_centered = inputs - mean
 
@@ -138,8 +139,8 @@ class PoseNet:
         self, features, end_points, reuse=None, no_interm=False, scope="pose"
     ):
         cfg = self.cfg
-        n_joints = cfg['num_joints']
-        num_layers = re.findall("resnet_([0-9]*)", cfg['net_type'])[0]
+        n_joints = cfg["num_joints"]
+        num_layers = re.findall("resnet_([0-9]*)", cfg["net_type"])[0]
         layer_name = (
             "resnet_v1_{}".format(num_layers) + "/block{}/unit_{}/bottleneck_v1"
         )
@@ -149,23 +150,25 @@ class PoseNet:
             out["part_pred"] = prediction_layer(
                 cfg, features, "part_pred", n_joints + cfg.get("num_idchannel", 0)
             )
-            if cfg['location_refinement']:
+            if cfg["location_refinement"]:
                 out["locref"] = prediction_layer(
                     cfg, features, "locref_pred", n_joints * 2
                 )
-            if cfg['pairwise_predict'] and "multi-animal" not in cfg['dataset_type']:
+            if cfg["pairwise_predict"] and "multi-animal" not in cfg["dataset_type"]:
                 out["pairwise_pred"] = prediction_layer(
-                    cfg,
-                    features,
-                    "pairwise_pred",
-                    n_joints * (n_joints - 1) * 2,
+                    cfg, features, "pairwise_pred", n_joints * (n_joints - 1) * 2
                 )
-            if cfg['partaffinityfield_predict'] and "multi-animal" in cfg['dataset_type']:
+            if (
+                cfg["partaffinityfield_predict"]
+                and "multi-animal" in cfg["dataset_type"]
+            ):
                 out["pairwise_pred"] = prediction_layer(
-                    cfg, features, "pairwise_pred", cfg['num_limbs'] * 2
+                    cfg, features, "pairwise_pred", cfg["num_limbs"] * 2
                 )
-            if cfg['intermediate_supervision'] and not no_interm:
-                interm_name = layer_name.format(3, cfg['intermediate_supervision_layer'])
+            if cfg["intermediate_supervision"] and not no_interm:
+                interm_name = layer_name.format(
+                    3, cfg["intermediate_supervision_layer"]
+                )
                 block_interm_out = end_points[interm_name]
                 out["part_pred_interm"] = prediction_layer(
                     cfg,
@@ -186,19 +189,15 @@ class PoseNet:
 
     def inference(self, inputs, aux):
         """ Direct TF inference on GPU.
-        Added with: https://arxiv.org/abs/1909.11229 
+        Added with: https://arxiv.org/abs/1909.11229
         """
         heads = self.get_net(inputs)
         locref = heads["locref"]
         probs = tf.sigmoid(heads["part_pred"])
 
-        if self.cfg['batch_size'] == 1:
-            print("WOOOOO LOOK AT US INFERENCING!!!!")
-            print("history:", aux)
-            print(self.cfg)
+        if self.cfg["batch_size"] == 1:
             # assuming batchsize 1 here!
             probs = tf.squeeze(probs, axis=0)
-
             locref = tf.squeeze(locref, axis=0)
             l_shape = tf.shape(probs)
 
@@ -226,15 +225,14 @@ class PoseNet:
             likelihood = tf.reshape(tf.gather_nd(probs, indices), (-1, 1))
 
             pose = (
-                self.cfg['stride'] * tf.cast(tf.transpose(loc), dtype=tf.float32)
-                + self.cfg['stride'] * 0.5
-                + offset * self.cfg['locref_stdev']
+                self.cfg["stride"] * tf.cast(tf.transpose(loc), dtype=tf.float32)
+                + self.cfg["stride"] * 0.5
+                + offset * self.cfg["locref_stdev"]
             )
             pose = tf.concat([pose, likelihood], axis=1)
 
             return {"pose": pose, "probs": probs}
         else:
-            print("Batch-size != 1")
             # probs = tf.squeeze(probs, axis=0)
             l_shape = tf.shape(probs)  # batchsize times x times y times body parts
             # locref = locref*cfg.locref_stdev
@@ -268,9 +266,9 @@ class PoseNet:
             likelihood = tf.reshape(tf.gather_nd(probs, indices), (-1, 1))
 
             pose = (
-                self.cfg['stride'] * tf.cast(tf.transpose(loc), dtype=tf.float32)
-                + self.cfg['stride'] * 0.5
-                + offset * self.cfg['locref_stdev']
+                self.cfg["stride"] * tf.cast(tf.transpose(loc), dtype=tf.float32)
+                + self.cfg["stride"] * 0.5
+                + offset * self.cfg["locref_stdev"]
             )
             pose = tf.concat([pose, likelihood], axis=1)
             return {"pose": pose}
@@ -279,9 +277,9 @@ class PoseNet:
         """ initialized during inference """
         prob = tf.sigmoid(heads["part_pred"])
         outputs = {"part_prob": prob}
-        if self.cfg['location_refinement']:
+        if self.cfg["location_refinement"]:
             outputs["locref"] = heads["locref"]
-        if self.cfg['pairwise_predict'] or self.cfg['partaffinityfield_predict']:
+        if self.cfg["pairwise_predict"] or self.cfg["partaffinityfield_predict"]:
             outputs["pairwise_pred"] = heads["pairwise_pred"]
         return outputs
 
@@ -289,7 +287,7 @@ class PoseNet:
         cfg = self.cfg
 
         heads = self.get_net(batch[Batch.inputs])
-        weigh_part_predictions = cfg['weigh_part_predictions']
+        weigh_part_predictions = cfg["weigh_part_predictions"]
         part_score_weights = (
             batch[Batch.part_score_weights] if weigh_part_predictions else 1.0
         )
@@ -302,25 +300,25 @@ class PoseNet:
         loss = {}
         loss["part_loss"] = add_part_loss("part_pred")
         total_loss = loss["part_loss"]
-        if cfg['intermediate_supervision']:
+        if cfg["intermediate_supervision"]:
             loss["part_loss_interm"] = add_part_loss("part_pred_interm")
             total_loss = total_loss + loss["part_loss_interm"]
 
-        if cfg['location_refinement']:
+        if cfg["location_refinement"]:
             locref_pred = heads["locref"]
             locref_targets = batch[Batch.locref_targets]
             locref_weights = batch[Batch.locref_mask]
             loss_func = (
                 losses.huber_loss
-                if cfg['locref_huber_loss']
+                if cfg["locref_huber_loss"]
                 else tf.losses.mean_squared_error
             )
-            loss["locref_loss"] = cfg['locref_loss_weight'] * loss_func(
+            loss["locref_loss"] = cfg["locref_loss_weight"] * loss_func(
                 locref_targets, locref_pred, locref_weights
             )
             total_loss = total_loss + loss["locref_loss"]
 
-        if cfg['pairwise_predict'] or cfg['partaffinityfield_predict']:
+        if cfg["pairwise_predict"] or cfg["partaffinityfield_predict"]:
             # setting pairwise bodypart loss
             pairwise_pred = heads["pairwise_pred"]
             pairwise_targets = batch[Batch.pairwise_targets]
@@ -328,10 +326,10 @@ class PoseNet:
 
             loss_func = (
                 losses.huber_loss
-                if cfg['pairwise_huber_loss']
+                if cfg["pairwise_huber_loss"]
                 else tf.losses.mean_squared_error
             )
-            loss["pairwise_loss"] = cfg['pairwise_loss_weight'] * loss_func(
+            loss["pairwise_loss"] = cfg["pairwise_loss_weight"] * loss_func(
                 pairwise_targets, pairwise_pred, pairwise_weights
             )
             total_loss = total_loss + loss["pairwise_loss"]
