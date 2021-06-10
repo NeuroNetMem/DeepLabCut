@@ -515,6 +515,7 @@ class KalmanFilter:
 
 def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
     """ Non batch wise pose estimation for video cap."""
+    LDBG = False
     ny, nx = int(cap.get(4)), int(cap.get(3))
     nbparts = dlc_cfg['num_joints']
     print(f'GetPoseS_GTF for {nframes} {nx}x{ny} frames with {nbparts} bodyparts')
@@ -536,12 +537,21 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
     counter = 0
     step = min(1, max(10, int(nframes / 1000)))
 
-    tqdm.write("Opening Video Capture")
+    if LDBG: tqdm.write("Build offender pairs")
+    if 'offending_pairs' in cfg:
+        offender_names = cfg["offending_pairs"]
+        offenders = [(dlc_cfg["all_joints_names"].index(bpn[0]), dlc_cfg["all_joints_names"].index(bpn[1])) for bpn in offender_names]
+    else:
+        offenders = None
 
-    offenders = [(n, n + (nbparts // 2)) for n in range(nbparts // 2)]  # (n, n+4) for n in range(4)
-    print("offenders:", offenders)
+    # n_pairs = 6
+    # off_offset = 5
+    # # offenders = [(n, n + (nbparts // 2)) for n in range(nbparts // 2)]  # (n, n+4) for n in range(4)
+    # offenders = [(n, n + n_pairs) for n in range(off_offset, off_offset+n_pairs)]
+    if LDBG:
+        tqdm.write("Offender pairs: " + str(offenders))
 
-    LDBG = False
+    tqdm.write("Enter frame loop")
     while cap.isOpened():
         if counter % step == 0:
             pbar.update(step)
@@ -550,47 +560,51 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
         if ret:
             frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
             if cfg["cropping"]:
-                frame = img_as_ubyte(
-                    frame[cfg["y1"] : cfg["y2"], cfg["x1"] : cfg["x2"]]
-                )
+                frame = img_as_ubyte(frame[cfg["y1"] : cfg["y2"], cfg["x1"] : cfg["x2"]])
             else:
                 frame = img_as_ubyte(frame)
             frame_s = np.expand_dims(frame, axis=0).astype(float)
 
-            mask = np.ones((88, 88, nbparts), dtype=float)*0
-
             last_prediction = PredictedData[counter-1, :].reshape(-1, 3) if counter else None
             kf_prediction = []
+
+            positive_sigma = 2
+            negative_sigma = 1.5
+            positive_bias, negative_bias = 0.9, 0.9
+            mask = np.zeros((88, 88, nbparts), dtype=float)
+            if LDBG: print("Created empty mask array")
 
             for n in range(nbparts):
                 if last_prediction is None:
                     continue
                 if LDBG: print(f'updating KF {n} with {last_prediction[n, :]}')
                 KFilter[n].correct(last_prediction[n, 0], last_prediction[n, 1])
-                if LDBG: print("Getting next position")
                 kf_prediction.append(KFilter[n].predict().flatten())
-                if LDBG: print(f'prediction: {kf_prediction[n]}')
+                if LDBG: print(f'KF {n} prediction: {kf_prediction[n]}')
 
-                if LDBG: tqdm.write("building mask")
-                offender_pair = [op for op in offenders if n in op][0]
-                # print("Offender pair:", offender_pair, [cfg['bodyparts'][o] for o in offender_pair])
+                potential_offenders = [op for op in offenders if n in op]
+                offender_pair = potential_offenders[0] if len(potential_offenders) else None
+                if LDBG:
+                    if LDBG: tqdm.write(f"Offender Pair: {offender_pair}")
+                    if offender_pair is not None:
+                        if LDBG: tqdm.write("Offender pair:" + str([cfg['bodyparts'][o] for o in offender_pair]))
 
-                # sig = abs(math.sin(counter / 150 * 2 * math.pi)) * 3 + 0.5
-                positive_sigma = 2
-                negative_sigma = 1.5
-                positive_bias, negative_bias = 0.9, 0.9
+                if negative_bias or positive_bias:
+                    if LDBG: tqdm.write("building mask")
+                    x = int(last_prediction[n, 0] * (88/frame.shape[1]))
+                    y = int(last_prediction[n, 1] * (88/frame.shape[0]))
+                    positive_gaussian = gaussian_heatmap(center=(x, y), image_size=(88, 88), sig=positive_sigma) * positive_bias
 
-                x = int(last_prediction[n, 0] * (88/frame.shape[1]))
-                y = int(last_prediction[n, 1] * (88/frame.shape[0]))
-                positive_bias = gaussian_heatmap(center=(x, y), image_size=(88, 88), sig=positive_sigma) * positive_bias
+                    if offender_pair is not None:
+                        xo = int(last_prediction[(n+nbparts//2) % nbparts, 0] * (88/frame.shape[1]))
+                        yo = int(last_prediction[(n+nbparts//2) % nbparts, 1] * (88/frame.shape[0]))
+                        negative_gaussian = gaussian_heatmap(center=(xo, yo), image_size=(88, 88), sig=negative_sigma) * -negative_bias
+                        mask[:, :, n] = negative_gaussian
 
-                xo = int(last_prediction[(n+nbparts//2) % nbparts, 0] * (88/frame.shape[1]))
-                yo = int(last_prediction[(n+nbparts//2) % nbparts, 1] * (88/frame.shape[0]))
-                negative_bias = gaussian_heatmap(center=(xo, yo), image_size=(88, 88), sig=negative_sigma) * -negative_bias
-                mask[:, :, n] = negative_bias
-                mask[:, :, n][positive_bias > 0.1] = 0
-                mask[:, :, n] = mask[:, :, n] + positive_bias
-                if LDBG: tqdm.write("mask done")
+                    mask[:, :, n][positive_gaussian > 0.1] = 0
+                    mask[:, :, n] = mask[:, :, n] + positive_gaussian
+                    # mask[: , :, n] = positive_bias
+                    if LDBG: tqdm.write("mask done")
 
             # mask[x, y, :] = 0
 
@@ -609,19 +623,16 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
             pose = sess_res
             pose[:, [0, 1, 2]] = pose[:, [1, 0, 2]]
             # pose = predict.getpose(frame, dlc_cfg, sess, inputs, outputs)
-            PredictedData[
-                counter, :
-            ] = (
-                pose.flatten()
-            )  # NOTE: thereby cfg['all_joints_names'] should be same order as bodyparts!
+            PredictedData[counter, :] = (pose.flatten())
+            # NOTE: thereby cfg['all_joints_names'] should be same order as bodyparts!
 
             # Writing prob_map out to images
-            show_live = True
             save_img = True
             if (save_img):
                 if LDBG: tqdm.write("Prepping output img")
-                ofw = 88
-                nfw = ofw*2
+                ofw = 88 # original frame width, == ceil(frame_width/8)
+                n_rows = 3
+                nfw = ofw*2 # upscale by factor 2
                 weighting = 0.35
                 smol_frame = cv2.resize(frame, (nfw, nfw), interpolation=cv2.INTER_AREA)*weighting
 
@@ -629,14 +640,15 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
                 prob_map = sess_res_prob.reshape((ofw, ofw, nbparts))
                 fname = f'img_out/{counter:05d}.png'
 
-                arr_out = np.zeros((2*ofw, (nbparts//2)*ofw, 1), dtype='uint8')
+                arr_out = np.zeros((n_rows*ofw, (math.ceil(nbparts/n_rows))*ofw, 1), dtype='uint8')
 
                 if LDBG: tqdm.write("arranging maps")
                 for n in range(nbparts):
-                    row = n // (nbparts // 2)
-                    col = n % (nbparts // 2)
+                    row = (n+1) // math.ceil(nbparts / n_rows)
+                    col = (n+1) % math.ceil(nbparts / n_rows)
                     arr_out[row*ofw:(row+1)*ofw, col*ofw:(col+1)*ofw, 0] = np.abs(prob_map[:, :, n] * 255).astype('uint8')
 
+                if LDBG: tqdm.write("arranging maps done")
                 # HERE WE SHOULD DELAY THE CASTING TO UINT8 UNTIL LAST MOMENT!
                 # * do everything in float
                 # * deal with positive/negative likelihoods seperately for shifted coloring
@@ -644,24 +656,29 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
 
                 if LDBG: tqdm.write("Converting image")
                 probs_img = cv2.cvtColor(arr_out, cv2.COLOR_GRAY2BGR)
+
                 # top row/bottom row
-                probs_img[:ofw, :, 2] = probs_img[:ofw, :, 2]/2
-                probs_img[ofw:, :, 0] = probs_img[ofw:, :, 0]/2
-                for n in range(nbparts//2):
-                    probs_img[:, ofw*n:ofw*(n+1), 1] = probs_img[:, ofw*n:ofw*(n+1), 1] * ((n+1) / (nbparts//2))
+                for r in range(n_rows):
+                    probs_img[:ofw, :, r] = probs_img[:ofw, :, r] * 0.5
+
+                # give unique color scheme to frames
+                for n in range(math.ceil(nbparts/n_rows)):
+                    probs_img[:, ofw*n:ofw*(n+1), 1] = probs_img[:, ofw*n:ofw*(n+1), 1] * ((n+1) / math.ceil(nbparts/n_rows))
 
                 if LDBG: tqdm.write("Resizing image")
-                img_out = cv2.resize(probs_img, ((nbparts//2)*nfw, 2*nfw), interpolation=cv2.INTER_CUBIC)
+                img_out = cv2.resize(probs_img, (math.ceil(nbparts/n_rows)*nfw, n_rows*nfw), interpolation=cv2.INTER_CUBIC)
 
                 # stacking/overlay after resize
                 if LDBG: tqdm.write("Overlaying images")
                 for n in range(nbparts):
-                    row = n // (nbparts//2)
-                    col = n % (nbparts//2)
+                    row = (n+1) // math.ceil(nbparts/n_rows)
+                    col = (n+1) % math.ceil(nbparts/n_rows)
+                    if LDBG: tqdm.write(f'{(n+1)}, {row}, {col}, {img_out.shape}')
                     img_out[row*nfw:(row+1)*nfw, col*nfw:(col+1)*nfw, :] = \
                     img_out[row*nfw:(row+1)*nfw, col*nfw:(col+1)*nfw, :]*(1-weighting) \
                         + smol_frame
 
+                    if LDBG: tqdm.write('img_out done')
                     # label the predicted point
                     fs_ratio_x = nfw/frame.shape[1]
                     fs_ratio_y = nfw/frame.shape[0]
@@ -673,6 +690,8 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
 
                     cv2.line(img_out, (px - cw, py), (px + cw, py), (255, 255, 255), 1)
                     cv2.line(img_out, (px, py - cw), (px, py + cw), (255, 255, 255), 1)
+                    if LDBG: tqdm.write('lines')
+
 
                     if last_prediction is not None:
                         kfx = int(kf_prediction[n][0]*fs_ratio_x +col*nfw)
@@ -681,6 +700,7 @@ def GetPoseS_GTF(cfg, dlc_cfg, sess, inputs, outputs, cap, nframes, aux=None):
                         kfuy = int(kf_prediction[n][3])
                         cv2.line(img_out, (kfx - kfux, kfy), (kfx + kfux, kfy), (0, 0, 255), 1)
                         cv2.line(img_out, (kfx, kfy - kfuy), (kfx, kfy + kfuy), (0, 0, 255), 1)
+                    if LDBG: tqdm.write('predict')
 
                 cv2.imwrite(fname, img_out)
 
